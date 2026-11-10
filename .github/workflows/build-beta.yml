@@ -1,0 +1,225 @@
+# Copy to huntermacias/spikeproof-releases as .github/workflows/build-beta.yml (source of truth:
+# desktop/public-build/ in the private repository).
+#
+# Builds Spikeproof's unsigned beta installers from the PRIVATE source on this PUBLIC repository's free
+# GitHub-hosted runners, without exposing the source:
+#   - Manual runs only (workflow_dispatch: only people with write access can start it). Fork pull requests
+#     never run it and never see its secrets.
+#   - The private source is checked out with a read-only token for that one repository, which is not
+#     persisted on the runner. The runner is a fresh VM that is discarded after the job.
+#   - Build and test output goes to a file, never to this public log: the log shows step names and
+#     pass/fail only. On failure the full log is uploaded ENCRYPTED to the LOG_CERT certificate (only its
+#     private key, kept on the maintainer's computer, can read it).
+#   - No caches, and no artifacts except that encrypted failure log. Installers go straight to a DRAFT
+#     release (visible only to maintainers). Nothing becomes public until a maintainer publishes the draft.
+#   - Only GitHub's own actions are used.
+name: Build beta
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Beta version, e.g. 0.1.0-beta.2"
+        required: true
+      ref:
+        description: "Branch, tag or commit of the private source"
+        required: true
+        default: main
+permissions: {}
+concurrency:
+  group: build-beta
+  cancel-in-progress: false
+env:
+  SOURCE_REPO: huntermacias/Spikeproof
+  RELEASES_REPO: ${{ github.repository }}
+  VERSION: ${{ inputs.version }}
+  TAG: v${{ inputs.version }}
+
+jobs:
+  prepare:
+    name: Check inputs and open a draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Check the version
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]] || { echo "::error::Version must look like 0.1.0-beta.2"; exit 1; }
+      - name: Resolve the source commit
+        id: source
+        env:
+          GH_TOKEN: ${{ secrets.SPIKEPROOF_SOURCE_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: |
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]{1,100}$ ]] || { echo "::error::Invalid ref"; exit 1; }
+          [ -n "$GH_TOKEN" ] || { echo "::error::Add the SPIKEPROOF_SOURCE_TOKEN secret to this repository"; exit 1; }
+          sha=$(gh api "repos/$SOURCE_REPO/commits/$REF" --jq .sha 2>/dev/null) || { echo "::error::Can't read the private source at that ref (check the token's access and expiry)"; exit 1; }
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Unexpected commit id"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Building source commit $sha"
+      - name: Open the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if state=$(gh release view "$TAG" -R "$RELEASES_REPO" --json isDraft --jq .isDraft 2>/dev/null); then
+            [ "$state" = "true" ] || { echo "::error::$TAG is already published. Bump the beta number."; exit 1; }
+            echo "Reusing the existing draft $TAG (clearing its files)"
+            for a in $(gh release view "$TAG" -R "$RELEASES_REPO" --json assets --jq '.assets[].name'); do
+              gh release delete-asset "$TAG" "$a" -R "$RELEASES_REPO" --yes
+            done
+          else
+            gh release create "$TAG" -R "$RELEASES_REPO" --draft --prerelease \
+              --title "Spikeproof $VERSION (beta)" --notes "Building. This draft is not public."
+          fi
+          # Every later step finds the draft by its tag; prove that works now rather than after the builds.
+          [ "$(gh release view "$TAG" -R "$RELEASES_REPO" --json isDraft --jq .isDraft)" = "true" ] \
+            || { echo "::error::Can't find the draft $TAG by its tag"; exit 1; }
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: darwin-arm64
+            files: Spikeproof-${{ inputs.version }}-mac-arm64.dmg Spikeproof-${{ inputs.version }}-mac-arm64.zip
+          - os: windows-latest
+            target: win32-x64
+            files: Spikeproof-Setup-${{ inputs.version }}.exe Spikeproof-Portable-${{ inputs.version }}-win-x64.zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 80
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      SPIKEPROOF_CHANNEL: beta
+      SPIKEPROOF_SIGNED_RELEASE: "0"
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Keep build output out of the public log
+        run: |
+          cat > "$RUNNER_TEMP/quiet.sh" <<'SH'
+          #!/usr/bin/env bash
+          # quiet.sh "Label" command args… : output goes to the private build log; the public log gets one line.
+          label=$1; shift
+          start=$(date +%s)
+          echo "===== $label: $*" >> "$RUNNER_TEMP/build.log"
+          if "$@" >> "$RUNNER_TEMP/build.log" 2>&1; then
+            echo "✓ $label ($(( $(date +%s) - start ))s)"
+          else
+            code=$?
+            echo "✗ $label failed (exit $code). The full output is in the encrypted log."
+            exit $code
+          fi
+          SH
+          : > "$RUNNER_TEMP/build.log"
+      - name: Check out the private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          token: ${{ secrets.SPIKEPROOF_SOURCE_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: source
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+      - name: Install dependencies
+        working-directory: source
+        run: bash "$RUNNER_TEMP/quiet.sh" "npm ci" npm ci
+      - name: Set the beta version
+        working-directory: source
+        run: bash "$RUNNER_TEMP/quiet.sh" "Set version $VERSION" npm version "$VERSION" --no-git-tag-version --allow-same-version
+      - name: Build installers
+        working-directory: source
+        run: bash "$RUNNER_TEMP/quiet.sh" "Build $TARGET installers" node desktop/package.cjs "$TARGET" --release
+      - name: Packaged app checks
+        working-directory: source
+        timeout-minutes: 15
+        run: bash "$RUNNER_TEMP/quiet.sh" "Packaged app checks" npm run test:desktop:packaged
+      - name: Install from the installer and check again
+        working-directory: source
+        timeout-minutes: 15
+        run: bash "$RUNNER_TEMP/quiet.sh" "Install and check" node desktop/test-installation.cjs
+      - name: Record checks (unsigned)
+        working-directory: source
+        run: |
+          bash "$RUNNER_TEMP/quiet.sh" "Record checks" node desktop/verify-signatures.cjs
+          node -e "require('fs').writeFileSync('dist-desktop/$TARGET/native-verification.json', JSON.stringify({ version: require('./package.json').version, passed: true }))"
+      - name: Add the installers to the draft
+        working-directory: source/dist-desktop/${{ matrix.target }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FILES: ${{ matrix.files }}
+        run: |
+          # Never add files to a release that is already public.
+          [ "$(gh release view "$TAG" -R "$RELEASES_REPO" --json isDraft --jq .isDraft)" = "true" ] \
+            || { echo "::error::$TAG is no longer a draft; not uploading"; exit 1; }
+          cp native-verification.json "$TARGET.native-verification.json"
+          cp signature-verification.json "$TARGET.signature-verification.json"
+          # shellcheck disable=SC2086
+          gh release upload "$TAG" -R "$RELEASES_REPO" --clobber $FILES "$TARGET.native-verification.json" "$TARGET.signature-verification.json"
+          echo "Uploaded to the draft: $FILES"
+      - name: Encrypt the build log (failures only)
+        if: failure()
+        env:
+          LOG_CERT: ${{ vars.LOG_CERT }}
+        run: |
+          [ -s "$RUNNER_TEMP/build.log" ] || exit 0
+          if [ -z "$LOG_CERT" ]; then echo "No LOG_CERT variable, so the build log is not uploaded."; exit 0; fi
+          printf '%s\n' "$LOG_CERT" > "$RUNNER_TEMP/log-cert.pem"
+          # smime works with both OpenSSL (Windows) and LibreSSL (macOS).
+          openssl smime -encrypt -binary -aes256 -outform DER \
+            -in "$RUNNER_TEMP/build.log" -out "$RUNNER_TEMP/build-log-$TARGET.cms" "$RUNNER_TEMP/log-cert.pem"
+      - name: Upload the encrypted log (failures only)
+        if: failure() && vars.LOG_CERT != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-build-log-${{ matrix.target }}
+          path: ${{ runner.temp }}/build-log-${{ matrix.target }}.cms
+          retention-days: 7
+          if-no-files-found: ignore
+
+  finalize:
+    name: Finish the draft (stays private)
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the private source (release scripts and notes)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          token: ${{ secrets.SPIKEPROOF_SOURCE_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: source
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+      - name: Checksums, manifest, notes; remove non-public files
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ "$(gh release view "$TAG" -R "$RELEASES_REPO" --json isDraft --jq .isDraft)" = "true" ] \
+            || { echo "::error::$TAG must still be a draft to be finished"; exit 1; }
+          npm version "$VERSION" --no-git-tag-version --allow-same-version > /dev/null
+          gh release download "$TAG" -R "$RELEASES_REPO" -D release-artifacts/downloaded
+          for t in darwin-arm64 win32-x64; do
+            mkdir -p "release-artifacts/$t"
+            for k in native signature; do
+              mv "release-artifacts/downloaded/$t.$k-verification.json" "release-artifacts/$t/$k-verification.json"
+            done
+          done
+          node desktop/publish-beta.cjs release-artifacts --update-draft
