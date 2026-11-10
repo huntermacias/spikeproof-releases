@@ -148,6 +148,10 @@ jobs:
         working-directory: source
         timeout-minutes: 15
         run: bash "$RUNNER_TEMP/quiet.sh" "Install and check" node desktop/test-installation.cjs
+      - name: Build the CI command line (one file, from the macOS job only)
+        if: matrix.target == 'darwin-arm64'
+        working-directory: source
+        run: bash "$RUNNER_TEMP/quiet.sh" "Build the CLI" node desktop/build-cli.cjs "dist-desktop/$TARGET"
       - name: Record checks (unsigned)
         working-directory: source
         run: |
@@ -164,6 +168,7 @@ jobs:
             || { echo "::error::$TAG is no longer a draft; not uploading"; exit 1; }
           cp native-verification.json "$TARGET.native-verification.json"
           cp signature-verification.json "$TARGET.signature-verification.json"
+          if [ "$TARGET" = "darwin-arm64" ]; then FILES="$FILES spikeproof-cli-$VERSION.mjs"; fi
           # shellcheck disable=SC2086
           gh release upload "$TAG" -R "$RELEASES_REPO" --clobber $FILES "$TARGET.native-verification.json" "$TARGET.signature-verification.json"
           echo "Uploaded to the draft: $FILES"
